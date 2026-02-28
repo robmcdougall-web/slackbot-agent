@@ -41,6 +41,16 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 ASK_FINANCE_CHANNEL_ID = os.environ["ASK_FINANCE_CHANNEL_ID"]
 ASK_NAVAN_CHANNEL_ID = os.environ["ASK_NAVAN_CHANNEL_ID"]
 
+# Test mode: listen in test channels, but read history from real channels
+TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
+if TEST_MODE:
+    LISTEN_FINANCE_CHANNEL_ID = os.environ["TEST_FINANCE_CHANNEL_ID"]
+    LISTEN_NAVAN_CHANNEL_ID = os.environ["TEST_NAVAN_CHANNEL_ID"]
+    logger.info("TEST MODE enabled — listening in test channels, reading history from real channels.")
+else:
+    LISTEN_FINANCE_CHANNEL_ID = ASK_FINANCE_CHANNEL_ID
+    LISTEN_NAVAN_CHANNEL_ID = ASK_NAVAN_CHANNEL_ID
+
 # Future Navan integration toggle
 NAVAN_ENABLED = False
 # When enabled, instantiate like:
@@ -59,8 +69,9 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # Channel configuration
 # ---------------------------------------------------------------------------
 CHANNEL_CONFIG = {
-    ASK_FINANCE_CHANNEL_ID: {
+    LISTEN_FINANCE_CHANNEL_ID: {
         "type": "finance",
+        "history_source": ASK_FINANCE_CHANNEL_ID,
         "system_prompt": (
             "You are a helpful finance assistant for the company Kaluza. "
             "You answer questions about expense policies, reimbursements, budgets, "
@@ -71,8 +82,9 @@ CHANNEL_CONFIG = {
             "the Finance team directly or posts in #ask-finance for a human follow-up."
         ),
     },
-    ASK_NAVAN_CHANNEL_ID: {
+    LISTEN_NAVAN_CHANNEL_ID: {
         "type": "navan",
+        "history_source": ASK_NAVAN_CHANNEL_ID,
         "system_prompt": (
             "You are a helpful travel and Navan assistant for the company Kaluza. "
             "You answer questions about travel booking via the Navan platform, "
@@ -124,8 +136,12 @@ def _refresh_single_channel(channel_id: str) -> dict:
 
 
 def refresh_cache() -> None:
-    """Refresh the history cache for all configured channels."""
-    for channel_id in CHANNEL_CONFIG:
+    """Refresh the history cache for all history source channels."""
+    # Deduplicate: in production mode, listen channel == history source
+    source_channels = {
+        config["history_source"] for config in CHANNEL_CONFIG.values()
+    }
+    for channel_id in source_channels:
         try:
             _history_cache[channel_id] = _refresh_single_channel(channel_id)
         except Exception:
@@ -354,7 +370,9 @@ def handle_mention(event, say):
         logger.info("Mention in unconfigured channel %s — ignoring.", channel_id)
         return
 
-    channel_type = CHANNEL_CONFIG[channel_id]["type"]
+    config = CHANNEL_CONFIG[channel_id]
+    channel_type = config["type"]
+    history_source = config["history_source"]
     bot_user_id = app.client.auth_test()["user_id"]
     question = _extract_question_text(event.get("text", ""), bot_user_id)
 
@@ -371,11 +389,11 @@ def handle_mention(event, say):
     )
 
     try:
-        # Find similar past Q&A
-        similar_qa = find_similar_qa_pairs(channel_id, question)
+        # Find similar past Q&A (reads from real channel history, even in test mode)
+        similar_qa = find_similar_qa_pairs(history_source, question)
         logger.info("Found %d similar past Q&A pairs.", len(similar_qa))
 
-        # Ask Claude
+        # Ask Claude (use listen channel_id for config lookup)
         answer = ask_claude(channel_id, question, similar_qa)
 
         say(text=answer, thread_ts=thread_ts)
